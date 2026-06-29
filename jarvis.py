@@ -16,7 +16,6 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 LOCAL_CITY = "Ateret"
 
-# ====================== Tools ======================
 def get_current_time():
     now = datetime.datetime.now()
     return f"🕒 השעה: {now.strftime('%H:%M')}"
@@ -55,7 +54,6 @@ def open_phone_app(app_name: str):
             return f"📱 פתחתי {app_name}"
     return f"❌ לא מכיר: {app_name}"
 
-# ====================== Handler ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.voice:
         await update.message.reply_text("🎙️ קיבלתי קול! תכתוב לי.")
@@ -78,17 +76,8 @@ def ask_jarvis(user_input):
             return open_phone_app(name)
         return open_program(name)
 
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": "You are Jarvis. Answer in Hebrew."}, {"role": "user", "content": user_input}],
-            temperature=0.7
-        )
-        return response.choices[0].message.content
-    except:
-        return "שגיאה, תנסה שוב"
+    return "לא הבנתי, תנסה שוב 😊"
 
-# ====================== Run ======================
 if __name__ == "__main__":
     token = os.getenv("TELEGRAM_TOKEN")
     if token:
