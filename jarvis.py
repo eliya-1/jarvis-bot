@@ -1,107 +1,100 @@
+import os
+import subprocess
+import datetime
+import logging
+import requests
+import webbrowser
+from dotenv import load_dotenv
 from groq import Groq
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from dotenv import load_dotenv
-import os
-import json
-import threading
+
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 load_dotenv()
-
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-MEMORY_FILE = "user_memory.json"
+LOCAL_CITY = "Ateret"
 
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
+# ====================== Tools ======================
+def get_current_time():
+    now = datetime.datetime.now()
+    return f"🕒 השעה: {now.strftime('%H:%M')}"
+
+def get_weather():
+    try:
+        r = requests.get(f"https://wttr.in/{LOCAL_CITY}?format=%C+%t", timeout=5)
+        return f"🌤️ מזג אוויר ב{LOCAL_CITY}:\n{r.text.strip()}" if r.status_code == 200 else "❌ לא הצלחתי"
+    except:
+        return "❌ שגיאה"
+
+def open_program(program_name: str):
+    key = program_name.lower().strip()
+    APPS = {"chrome": "chrome", "כרום": "chrome", "notepad": "notepad", "פנקס": "notepad", "calculator": "calc", "מחשבון": "calc"}
+    if key in APPS:
         try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            subprocess.Popen(['start', '', APPS[key]], shell=True)
+            return f"✅ פתחתי {program_name}"
         except:
-            return {}
-    return {}
+            return f"❌ לא הצלחתי"
+    return f"❌ לא מכיר: {program_name}"
 
-def save_memory(memory):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory, f, ensure_ascii=False, indent=2)
+def open_phone_app(app_name: str):
+    name = app_name.lower().strip()
+    apps = {
+        "וואטסאפ": "https://wa.me/",
+        "whatsapp": "https://wa.me/",
+        "יוטיוב": "https://youtube.com",
+        "youtube": "https://youtube.com",
+        "אינסטגרם": "https://instagram.com",
+        "instagram": "https://instagram.com"
+    }
+    for k in apps:
+        if k in name:
+            webbrowser.open(apps[k])
+            return f"📱 פתחתי {app_name}"
+    return f"❌ לא מכיר: {app_name}"
 
-user_memory = load_memory()
+# ====================== Handler ======================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.voice:
+        await update.message.reply_text("🎙️ קיבלתי קול! תכתוב לי.")
+        return
 
-def open_program(program_name: str) -> str:
-    return f"✅ Opened {program_name}."
-
-def play_song(song_name: str) -> str:
-    return f"🎵 Playing '{song_name}'."
-
-def save_user_info(key: str, value: str, user_id: str) -> str:
-    if user_id not in user_memory:
-        user_memory[user_id] = {}
-    user_memory[user_id][key.lower()] = value
-    save_memory(user_memory)
-    return f"✅ Saved: {key} = {value}"
-
-tools = [
-    {"type": "function", "function": {"name": "open_program", "description": "Open programs", "parameters": {"type": "object", "properties": {"program_name": {"type": "string"}}, "required": ["program_name"]}}},
-    {"type": "function", "function": {"name": "play_song", "description": "Play song", "parameters": {"type": "object", "properties": {"song_name": {"type": "string"}}, "required": ["song_name"]}}},
-    {"type": "function", "function": {"name": "save_user_info", "description": "Save user info", "parameters": {"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}}}
-]
-
-available_functions = {
-    "open_program": open_program,
-    "play_song": play_song,
-    "save_user_info": lambda key, value, user_id="telegram": save_user_info(key, value, user_id)
-}
-
-conversations = {}
-
-def get_system_prompt(user_id):
-    memory = user_memory.get(user_id, {})
-    memory_text = "\n".join([f"{k}: {v}" for k, v in memory.items()])
-    return f"You are Jarvis, a smart AI assistant.\n\nMemory:\n{memory_text or 'No info yet.'}"
-
-def ask_jarvis(conversation_id, user_input):
-    if conversation_id not in conversations:
-        conversations[conversation_id] = []
-    messages = conversations[conversation_id]
-    messages.append({"role": "user", "content": user_input})
-    if len(messages) > 20:
-        messages = messages[-18:]
-    full_messages = [{"role": "system", "content": get_system_prompt(conversation_id)}] + messages
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=full_messages,
-        tools=tools,
-        temperature=0.7,
-    )
-    response_message = response.choices[0].message
-    tool_calls = response_message.tool_calls
-    if tool_calls:
-        messages.append(response_message)
-        for tool_call in tool_calls:
-            func_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
-            if func_name == "save_user_info":
-                args["user_id"] = conversation_id
-            result = available_functions[func_name](**args)
-            messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": func_name, "content": str(result)})
-        final = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-        )
-        final_text = final.choices[0].message.content
-        messages.append({"role": "assistant", "content": final_text})
-        return final_text
-    else:
-        messages.append({"role": "assistant", "content": response_message.content})
-        return response_message.content
-
-async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = f"telegram_{update.effective_user.id}"
-    reply = ask_jarvis(user_id, update.message.text)
+    reply = ask_jarvis(update.message.text)
     await update.message.reply_text(reply)
 
+def ask_jarvis(user_input):
+    text = user_input.lower().strip()
+
+    if any(w in text for w in ["שעה", "time"]):
+        return get_current_time()
+    if any(w in text for w in ["מזג", "weather"]):
+        return get_weather()
+
+    if any(w in text for w in ["פתח", "open", "תפתח"]):
+        name = user_input.replace("פתח", "").replace("open", "").replace("תפתח", "").strip()
+        if any(word in name.lower() for word in ["יוטיוב", "youtube", "אינסטגרם", "instagram", "וואטסאפ", "whatsapp"]):
+            return open_phone_app(name)
+        return open_program(name)
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": "You are Jarvis. Answer in Hebrew."}, {"role": "user", "content": user_input}],
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    except:
+        return "שגיאה, תנסה שוב"
+
+# ====================== Run ======================
 if __name__ == "__main__":
-    print("Jarvis Bot is starting...")
-    app = Application.builder().token(os.getenv("TELEGRAM_TOKEN")).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
-    app.run_polling()
+    token = os.getenv("TELEGRAM_TOKEN")
+    if token:
+        app = Application.builder().token(token).build()
+        app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
+        print("🤖 Jarvis is running...")
+        app.run_polling()
+    else:
+        print("No TELEGRAM_TOKEN found")
