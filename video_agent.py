@@ -98,13 +98,63 @@ def find_font():
 HEB = re.compile(r"[\u0590-\u05FF]")
 
 
+LTR_RUN = re.compile(r"%?[A-Za-z0-9](?:[A-Za-z0-9@#:.,/%+_\-' ]*[A-Za-z0-9])?")
+MIRROR = str.maketrans("()[]{}<>", ")(][}{><")
+
+
 def visual_rtl(text: str) -> str:
-    """FFmpeg מצייר טקסט משמאל לימין - הופכים עברית כדי שתיראה נכון."""
+    """FFmpeg מצייר טקסט משמאל לימין - הופכים עברית כדי שתיראה נכון,
+    אבל משאירים מספרים ואנגלית בכיוון הנכון (10:30 נשאר 10:30)."""
     if not HEB.search(text):
         return text
-    words = text.split(" ")
-    words = [w[::-1] if HEB.search(w) else w for w in words]
-    return " ".join(reversed(words))
+    rev = text[::-1].translate(MIRROR)
+    return LTR_RUN.sub(lambda m: m.group(0)[::-1], rev)
+
+
+def wrap_text(text, fs, w, max_lines=3):
+    """שובר טקסט לשורות כך שייכנס ברוחב המסך. מחזיר (שורות, גודל פונט)."""
+    while True:
+        max_chars = max(4, int(0.9 * w / (0.56 * fs)))
+        lines, cur = [], ""
+        for word in text.split():
+            if cur and len(cur) + 1 + len(word) > max_chars:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = f"{cur} {word}".strip()
+        if cur:
+            lines.append(cur)
+        if (len(lines) <= max_lines and all(len(l) <= max_chars for l in lines)) or fs < 20:
+            return lines, fs
+        fs *= 0.85
+
+
+def text_vf(agent, text, w, h, size, pos, fade_at=None, enable=None, boxalpha=0.5):
+    """מחזיר פילטר drawtext (שורה או כמה שורות ממורכזות) לטקסט בכל שפה.
+    size = חלק מגובה המסך (למשל 14 => h/14), pos = top/center/bottom."""
+    font = find_font()
+    lines, fs = wrap_text(text, min(h / size, w / size * 1.25), w)
+    fs = int(fs)
+    line_h = int(fs * 1.45)
+    block = line_h * len(lines)
+    y0 = {"top": int(h * 0.08), "center": (h - block) // 2,
+          "bottom": int(h - h * 0.1 - block)}[pos]
+    filters = []
+    for i, line in enumerate(lines):
+        agent.counter += 1
+        tf = Path(agent.workdir) / f"text_{agent.counter}.txt"
+        tf.write_text(visual_rtl(line), encoding="utf-8")
+        parts = [f"textfile={ffpath(tf)}", "expansion=none", f"fontsize={fs}", "fontcolor=white",
+                 "box=1", f"boxcolor=black@{boxalpha}", f"boxborderw={max(8, fs // 4)}",
+                 "x=(w-text_w)/2", f"y={y0 + i * line_h}"]
+        if font:
+            parts.insert(0, f"fontfile={ffpath(font)}")
+        if fade_at is not None:
+            parts.append(f"alpha='if(lt(t,{fade_at}),0,min(1,(t-{fade_at})/0.4))'")
+        if enable:
+            parts.append(f"enable='{enable}'")
+        filters.append("drawtext=" + ":".join(parts))
+    return ",".join(filters)
 
 
 def atempo_chain(speed: float) -> str:
@@ -608,20 +658,11 @@ def p_text(seg):
 
 
 def x_text(agent, inp, out, p):
-    font = find_font()
-    tf = Path(agent.workdir) / f"text_{agent.counter}.txt"
-    tf.write_text(visual_rtl(p["text"]), encoding="utf-8")
-    y = {"top": "h*0.08", "center": "(h-text_h)/2", "bottom": "h-text_h-h*0.08"}[p["pos"]]
-    fs = {"big": "h/9", "normal": "h/14", "small": "h/22"}[p["size"]]
-    parts = [f"textfile={ffpath(tf)}", f"fontsize={fs}", "fontcolor=white",
-             "box=1", "boxcolor=black@0.5", "boxborderw=20",
-             "x=(w-text_w)/2", f"y={y}"]
-    if font:
-        parts.insert(0, f"fontfile={ffpath(font)}")
-    if p["range"]:
-        a, b = p["range"]
-        parts.append(f"enable='between(t,{a},{b})'")
-    simple_pass(agent, inp, out, vf="drawtext=" + ":".join(parts))
+    info = agent.info(inp)
+    size = {"big": 9, "normal": 14, "small": 22}[p["size"]]
+    enable = f"between(t,{p['range'][0]},{p['range'][1]})" if p["range"] else None
+    vf = text_vf(agent, p["text"], info["width"], info["height"], size, p["pos"], enable=enable)
+    simple_pass(agent, inp, out, vf=vf)
     return f"נוסף טקסט: {p['text']}"
 
 
@@ -757,6 +798,229 @@ p_shot.run = x_shot
 p_shot.ext = ".png"
 
 
+# ---------------------------------------------------------------- create from images
+# יצירת סרטון מאפס מתמונות + קובץ "רעיון" - הכל לפי חוקים, בלי AI.
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+IDEA_FILES = ["רעיון.txt", "idea.txt", "תסריט.txt", "script.txt"]
+FPS = 30
+
+STYLES = {
+    "calm":      {"sec": 4.0, "trans": 1.2,  "zoom": 0.12, "fx": ["fade", "dissolve"]},
+    "normal":    {"sec": 3.0, "trans": 0.8,  "zoom": 0.15, "fx": ["fade", "smoothleft", "circleopen", "smoothright"]},
+    "energetic": {"sec": 2.0, "trans": 0.35, "zoom": 0.22, "fx": ["slideleft", "slideup", "wipeleft", "slideright", "circleopen", "radial"]},
+}
+STYLE_WORDS = {
+    "calm": ["רגוע", "עדין", "רומנטי", "איטי", "נוסטלגי", "calm", "slow", "soft"],
+    "energetic": ["אנרגטי", "מהיר", "קצבי", "דינמי", "מקפיץ", "energetic", "fast", "dynamic"],
+    "normal": ["רגיל", "normal"],
+}
+FORMATS = {"vertical": (1080, 1920), "horizontal": (1920, 1080), "square": (1080, 1080)}
+CREATE_RE = re.compile(r"^\s*(צור|תצור|יצור|תיצור|תעשה|create|make|מצגת|slideshow)\b", re.IGNORECASE)
+SETTING_KEYS = {
+    "title": ["כותרת", "title"], "outro": ["סיום", "outro", "end"], "style": ["סגנון", "style"],
+    "format": ["פורמט", "format"], "sec": ["שניות", "seconds"], "length": ["אורך", "length"],
+    "music": ["מוזיקה", "מוסיקה", "שיר", "music", "song"], "transition": ["מעבר", "transition"],
+}
+
+
+def natural_key(p):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", Path(p).name.lower())]
+
+
+def detect_format(text):
+    if has_any(text, ["ריבוע", "מרובע", "square", "1:1"]):
+        return "square"
+    if has_any(text, ["אנכי", "טיקטוק", "tiktok", "רילס", "reels", "שורטס", "shorts", "סטורי", "story", "9:16"]):
+        return "vertical"
+    if has_any(text, ["אופקי", "16:9", "יוטיוב", "youtube", "רחב"]):
+        return "horizontal"
+    return None
+
+
+def detect_style(text):
+    for name, words in STYLE_WORDS.items():
+        if has_any(text, words):
+            return name
+    return None
+
+
+def read_idea(folder: Path, opts: dict):
+    """קורא את קובץ הרעיון (רעיון.txt) מהתיקייה, אם קיים."""
+    f = next((folder / n for n in IDEA_FILES if (folder / n).exists()), None)
+    if not f:
+        return None
+    images = {p.name.lower(): p.name for p in folder.iterdir()}
+    stems = {p.stem.lower(): p.name for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXT}
+    for raw in f.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or set(line) <= {"-", "="}:
+            continue
+        key, _, val = line.partition(":")
+        k, val = key.strip().lower(), val.strip().strip('"')
+        setting = next((s for s, words in SETTING_KEYS.items() if k in words), None) if val else None
+        if setting == "style":
+            opts["style"] = detect_style(val.lower()) or opts["style"]
+        elif setting == "format":
+            opts["format"] = detect_format(val.lower()) or opts["format"]
+        elif setting in ("sec", "length"):
+            m = re.search(TIME, val)
+            if m:
+                opts[setting] = parse_time(m.group(0))
+        elif setting == "music":
+            p = Path(val)
+            opts["music"] = str(p if p.is_absolute() else folder / p)
+        elif setting:
+            opts[setting] = val
+        elif val and (k in images or k in stems):
+            opts["captions"][images.get(k) or stems[k]] = val
+        else:
+            opts["seq_captions"].append(line)
+    return f.name
+
+
+def parse_create_opts(seg: str, opts: dict) -> bool:
+    """מעדכן אפשרויות יצירה מתוך קטע פקודה. מחזיר True אם הקטע היה אפשרות יצירה."""
+    low = seg.lower()
+    hit = False
+    q = quoted_text(seg)
+    if re.search(r"(כותרת|title)", low):
+        opts["title"] = q or re.sub(r".*?(כותרת|title)\s*[:=]?\s*", "", seg, flags=re.I).strip()
+        return True
+    if re.search(r"(סיום|outro|\bend\b)", low):
+        opts["outro"] = q or re.sub(r".*?(סיום|outro|end)\s*[:=]?\s*", "", seg, flags=re.I).strip()
+        return True
+    if has_any(low, SETTING_KEYS["music"]):
+        paths = find_paths(seg)
+        if paths:
+            opts["music"] = paths[0]
+            return True
+    m = re.search(rf"(?:אורך|length|total)\s*({TIME})|({TIME})\s*(?:שניות)?\s*(?:סה\"כ|סהכ|בסך הכל|total)", low)
+    if m:
+        opts["length"] = parse_time(m.group(1) or m.group(2))
+        hit = True
+    else:
+        m = re.search(rf"({NUM})\s*(?:שניות|שנ'|sec|s)\b|(?:שניות|seconds)\s*({NUM})", low)
+        if m:
+            opts["sec"] = float(m.group(1) or m.group(2))
+            hit = True
+    fmt, style = detect_format(low), detect_style(low)
+    if fmt:
+        opts["format"] = fmt
+        hit = True
+    if style:
+        opts["style"] = style
+        hit = True
+    if has_any(low, ["בלי זום", "ללא זום", "no zoom"]):
+        opts["zoom"] = False
+        hit = True
+    if has_any(low, ["בלי מעברים", "ללא מעברים", "no transition"]):
+        opts["transitions"] = False
+        hit = True
+    if has_any(low, ["רקע מטושטש", "טשטוש", "בלי חיתוך", "blur", "fit"]):
+        opts["fit"] = "blur"
+        hit = True
+    m = re.search(r"(?:מעבר|transition)\s+([a-z]+)", low)
+    if m:
+        opts["fx"] = m.group(1)
+        hit = True
+    return hit
+
+
+def default_create_opts():
+    return {"style": "normal", "format": None, "sec": None, "length": None, "title": None,
+            "outro": None, "music": None, "zoom": True, "transitions": True, "fit": "cover",
+            "fx": None, "captions": {}, "seq_captions": []}
+
+
+def make_image_clip(agent, img, out, w, h, dur, i, opts, caption=None, title=None):
+    st = STYLES[opts["style"]]
+    frames = max(1, round(dur * FPS))
+    W2, H2 = w * 2, h * 2                                   # הגדלה כפולה = זום חלק בלי רעידות
+    if opts["fit"] == "blur":
+        base = (f"split[a][b];[a]scale={W2}:{H2}:force_original_aspect_ratio=increase,crop={W2}:{H2},"
+                f"boxblur=40:10[bg];[b]scale={W2}:{H2}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2")
+    else:
+        base = f"scale={W2}:{H2}:force_original_aspect_ratio=increase,crop={W2}:{H2}"
+    z = st["zoom"] if opts["zoom"] else 0
+    cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    moves = [  # מתחלפים בין תמונות כדי שלא ישעמם
+        (f"1+{z}*on/{frames}", cx, cy),
+        (f"1+{z}-{z}*on/{frames}", cx, cy),
+        (f"1+{z}", f"(iw-iw/zoom)*on/{frames}", cy),
+        (f"1+{z}", f"(iw-iw/zoom)*(1-on/{frames})", cy),
+    ]
+    zx, xx, yy = moves[i % len(moves)] if z else ("1", "0", "0")
+    vf = (f"{base},zoompan=z='{zx}':x='{xx}':y='{yy}':d={frames}:s={w}x{h}:fps={FPS},"
+          f"setsar=1,format=yuv420p")
+    if title:
+        vf += "," + text_vf(agent, title, w, h, 11, "center", fade_at=0.2, boxalpha=0.45)
+    if caption:
+        vf += "," + text_vf(agent, caption, w, h, 18, "bottom", fade_at=0.3, boxalpha=0.45)
+    run_ff(["-i", img, "-filter_complex", vf, "-frames:v", frames, "-r", FPS] + ENCODE_V + [out])
+    return frames / FPS
+
+
+def create_video(agent, images, opts, out, log=print):
+    if not images:
+        raise EditError("לא נמצאו תמונות (jpg / png / webp)")
+    if not opts["format"]:
+        dims = [agent.info(p) for p in images]
+        portrait = sum(d["height"] > d["width"] for d in dims)
+        opts["format"] = "vertical" if portrait >= len(images) / 2 else "horizontal"
+    w, h = FORMATS[opts["format"]]
+    st = STYLES[opts["style"]]
+    n = len(images)
+    outro_d = 2.5 if opts["outro"] else 0
+    T = st["trans"] if opts["transitions"] and n > 1 else 0
+    sec = opts["sec"] or st["sec"]
+    if opts["length"]:                       # אורך כולל מבוקש -> מחשבים כמה זמן לכל תמונה
+        title_d = 0.8 if opts["title"] else 0
+        sec = (opts["length"] - outro_d - title_d + (n - 1 + (1 if outro_d else 0)) * T) / n
+    sec = max(sec, 1.0)
+    T = min(T, sec / 2)
+    fx_list = [opts["fx"]] if opts["fx"] else st["fx"]
+
+    seq = list(opts["seq_captions"])
+    clips, durs = [], []
+    for i, img in enumerate(images):
+        cap = opts["captions"].get(Path(img).name) or (seq.pop(0) if seq else None)
+        d = sec + (0.8 if i == 0 and opts["title"] else 0)
+        clip = os.path.join(agent.workdir, f"clip_{i}.mp4")
+        log(f"   🖼️ {i + 1}/{n} {Path(img).name}" + (f"  «{cap}»" if cap else ""))
+        durs.append(make_image_clip(agent, img, clip, w, h, d, i, opts, cap,
+                                    opts["title"] if i == 0 else None))
+        clips.append(clip)
+    if outro_d:
+        clip = os.path.join(agent.workdir, "clip_outro.mp4")
+        run_ff(["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={FPS}:d={outro_d}",
+                "-vf", text_vf(agent, opts["outro"], w, h, 14, "center", fade_at=0.4 + T, boxalpha=0)] + ENCODE_V + [clip])
+        clips.append(clip)
+        durs.append(outro_d)
+
+    args, fc = [], []
+    for c in clips:
+        args += ["-i", c]
+    if T and len(clips) > 1:
+        prev, off = "[0:v]", 0.0
+        for k in range(1, len(clips)):
+            off += durs[k - 1] - T
+            label = f"[x{k}]"
+            fc.append(f"{prev}[{k}:v]xfade=transition={fx_list[(k - 1) % len(fx_list)]}:"
+                      f"duration={T:.3f}:offset={off:.3f}{label}")
+            prev = label
+        vout = prev
+    else:
+        fc.append("".join(f"[{k}:v]" for k in range(len(clips))) + f"concat=n={len(clips)}:v=1:a=0[cv]")
+        vout = "[cv]"
+    total = sum(durs) - T * (len(clips) - 1)
+    args += ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
+    run_ff(args + ["-filter_complex", ";".join(fc), "-map", vout, "-map", f"{len(clips)}:a"]
+           + ENCODE_V + ENCODE_A + ["-shortest", "-movflags", "+faststart", out])
+    return f"נוצר סרטון {w}x{h} מ-{n} תמונות ({fmt_time(total)}, סגנון {opts['style']})"
+
+
 # ---------------------------------------------------------------- the agent
 
 HELP = """
@@ -777,6 +1041,15 @@ HELP = """
  דחיסה      דחוס | דחוס ל 25mb
  ייצוא      gif | mp3 | צילום מסך 0:05
  מתכונים    מתכון טיקטוק  (מוגדרים ב-video_recipes.json)
+
+ ✨ יצירה מאפס מתמונות:
+            צור "C:\\Photos\\טיול"                       (כל התמונות בתיקייה, לפי סדר השמות)
+            צור "C:\\Photos\\טיול", אנכי, אנרגטי, אורך 30, כותרת "הטיול שלנו", סיום "תודה!"
+            צור a.jpg b.jpg c.jpg, 4 שניות, רגוע, מוזיקה song.mp3
+            אפשרויות: אנכי/ריבוע/אופקי | רגוע/רגיל/אנרגטי | N שניות (לתמונה) | אורך N (סה"כ)
+                      כותרת "..." | סיום "..." | מוזיקה x.mp3 | בלי זום | בלי מעברים | רקע מטושטש
+            ואפשר להוסיף אחרי זה כל פקודת עריכה רגילה: , טקסט "..." , לוגו logo.png , פייד
+            רעיון.txt בתיקייה = התסריט (כותרת / סגנון / מוזיקה / כיתוב לכל תמונה) - ראה VIDEO_AGENT.md
 
  ניהול      פתח <קובץ> | שמור [קובץ] | בטל | מידע | היסטוריה | עזרה | יציאה
  קבצים עם רווחים בשם - לשים במרכאות: "C:\\My Videos\\clip.mp4"
@@ -846,8 +1119,8 @@ class VideoAgent:
     def save(self, path=None):
         if not self.current:
             raise EditError("אין סרטון פתוח")
-        if len(self.history) == 1:
-            raise EditError("עוד לא בוצעו שינויים")
+        if not self.dirty:
+            raise EditError("אין שינויים חדשים לשמור")
         out = Path(path).expanduser() if path else self.default_output()
         if not out.suffix:
             out = out.with_suffix(".mp4")
@@ -855,6 +1128,73 @@ class VideoAgent:
         shutil.copyfile(self.current, out)
         self.saved_at = len(self.history)
         return f"💾 נשמר: {out}", str(out)
+
+    @property
+    def dirty(self):
+        return bool(self.history) and self.saved_at != len(self.history)
+
+    def create(self, text, log=print):
+        """צור <תיקייה או תמונות>, אפשרויות... , פקודות עריכה... -> סרטון חדש."""
+        segments = [s for s in SPLIT_RE.split(text) if s and s.strip()]
+        first = CREATE_RE.sub("", segments[0], count=1).strip()
+        first = re.sub(r"^(?:סרטון|וידאו|video)?\s*(?:מ|מה|from)?\s*(?:התמונות|תמונות|התיקייה|תיקייה|images|photos)?\s*",
+                       "", first, flags=re.I).strip()
+        m = re.match(r'\s*"([^"]+)"|\s*\'([^\']+)\'', first)
+        if m:
+            paths = [m.group(1) or m.group(2)]
+            first = first[m.end():]
+            paths += find_paths(first)
+        else:
+            paths = find_paths(first)
+            if not paths and first:
+                paths = [first.split()[0]]
+        for p in paths:
+            first = first.replace(p, " ")
+        if not paths:
+            raise EditError('צריך להגיד מאיפה התמונות, למשל: צור "C:\\Photos\\טיול"')
+
+        images, folder = [], None
+        for p in paths:
+            pp = Path(p.strip('"\'')).expanduser()
+            if pp.is_dir():
+                folder = folder or pp
+                images += sorted((f for f in pp.iterdir() if f.suffix.lower() in IMAGE_EXT), key=natural_key)
+            elif pp.suffix.lower() in IMAGE_EXT and pp.exists():
+                folder = folder or pp.parent
+                images.append(pp)
+            else:
+                raise EditError(f"לא נמצא: {pp}")
+
+        opts = default_create_opts()
+        idea = read_idea(folder, opts)
+        parse_create_opts(first, opts)
+        rest, absorbing = [], True
+        for seg in segments[1:]:
+            if absorbing and parse_create_opts(seg, opts):
+                continue
+            absorbing = False
+            rest.append(seg)
+
+        log(f"✨ יוצר סרטון מ-{len(images)} תמונות" + (f" (לפי {idea})" if idea else "") + " ...")
+        self.counter += 1
+        out = os.path.join(self.workdir, f"created_{self.counter}.mp4")
+        msg = create_video(self, [str(i) for i in images], opts, out, log)
+        self.source = (folder / (folder.name or "video")).resolve()
+        self.history = [(out, "נוצר מתמונות")]
+        self.saved_at = 0
+        if opts["music"]:
+            music = Path(opts["music"]).expanduser()
+            self.counter += 1
+            step = os.path.join(self.workdir, f"step_{self.counter}.mp4")
+            x_music(self, out, step, {"file": str(music), "volume": 1.0, "replace": True})
+            self.counter += 1
+            step2 = os.path.join(self.workdir, f"step_{self.counter}.mp4")
+            dur = self.info(step)["duration"]
+            simple_pass(self, step, step2, af=f"afade=t=out:st={max(0, dur - 2):.3f}:d=2")
+            self.history[0] = (step2, "נוצר מתמונות + מוזיקה")
+            msg += f" + מוזיקה {music.name}"
+        log(f"✅ {msg}  [{self.describe(self.current)}]")
+        return ", ".join(rest)
 
     def undo(self):
         if len(self.history) <= 1:
@@ -892,8 +1232,12 @@ class VideoAgent:
     # -- execution
     def execute(self, text, log=print):
         """מריץ שרשרת פעולות. מחזיר רשימת קבצי ייצוא (gif/mp3/png) שנוצרו."""
+        if CREATE_RE.match(text):
+            text = self.create(text, log)
+            if not text:
+                return []
         if not self.current:
-            raise EditError("אין סרטון פתוח. כתוב: פתח <נתיב לקובץ>")
+            raise EditError("אין סרטון פתוח. כתוב: פתח <נתיב לקובץ>  או  צור <תיקיית תמונות>")
         actions, unknown = self.parse(text)
         for u in unknown:
             log(f"🤷 לא הבנתי: {u}")
@@ -941,7 +1285,7 @@ def repl(agent):
         low = line.lower()
         try:
             if low in ("יציאה", "צא", "exit", "quit", "q"):
-                if len(agent.history) > 1 and agent.saved_at != len(agent.history):
+                if agent.dirty:
                     try:
                         ans = input("יש שינויים שלא נשמרו. לשמור? (כ/ל) ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
@@ -968,7 +1312,7 @@ def repl(agent):
                 for k, v in agent.recipes.items():
                     print(f"  {k}: {v}")
             else:
-                if not agent.current:
+                if not agent.current and not CREATE_RE.match(line):
                     p = find_paths(line)
                     if p and Path(p[0]).suffix.lower() in VIDEO_EXT:
                         print(agent.load(p[0]))
@@ -980,7 +1324,7 @@ def repl(agent):
 
 def main():
     ap = argparse.ArgumentParser(description="סוכן עריכת וידאו מבוסס חוקים (FFmpeg)")
-    ap.add_argument("input", nargs="?", help="קובץ וידאו")
+    ap.add_argument("input", nargs="?", help="קובץ וידאו, או תיקיית תמונות ליצירת סרטון מאפס")
     ap.add_argument("command", nargs="?", help='פקודות, למשל: "חתוך 0:05-0:20, אנכי"')
     ap.add_argument("-o", "--output", help="קובץ פלט")
     ap.add_argument("--batch", metavar="FOLDER", help="להריץ את הפקודה על כל הסרטונים בתיקייה")
@@ -1001,7 +1345,7 @@ def main():
                 print(f"\n=== {f.name} ===")
                 agent.load(f)
                 agent.execute(command)
-                if len(agent.history) > 1:
+                if agent.dirty:
                     print(agent.save(outdir / f"{f.stem}.mp4")[0])
             except EditError as e:
                 print(f"❌ {e}")
@@ -1011,11 +1355,15 @@ def main():
 
     agent = VideoAgent()
     try:
+        if args.input and Path(args.input).is_dir():
+            agent.execute(f'צור "{args.input}", ' + (args.command or ""))
+            print(agent.save(args.output)[0])
+            return
         if args.input:
             print(agent.load(args.input))
         if args.input and args.command:
             agent.execute(args.command)
-            if len(agent.history) > 1:
+            if agent.dirty:
                 print(agent.save(args.output)[0])
         else:
             repl(agent)
